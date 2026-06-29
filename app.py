@@ -11,6 +11,9 @@ import geopandas as gpd
 import json
 import numpy as np
 
+my_blue = '#0A9DC7'
+my_red = '#AC0000'
+
 #
 #    TODO:  Use lists of precincts for each district and use them to filter data
 #           get list of city name and zip codes for each precint
@@ -50,6 +53,8 @@ dict_election_candidates = {
     'SCC_BOS_D1': bos_names,
     'SJ_CM_D9':   sj_d9_names
 }
+
+trend_options = ['TURNOUT_PCT', 'REDNESS', 'BLUENESS']
 #----- LOAD AND CLEAN DATA -----------------------------------------------------
 root_file = 'df_plot'
 if os.path.exists(root_file + '.parquet'):
@@ -173,6 +178,17 @@ def normalize_selection(selected_value, all_values_list):
     
     # Handle single string value
     return [selected_value]
+
+
+def normalize_trend_selection(selected_trend):
+    '''Normalize trend dropdown value to a valid single trend column.'''
+    if isinstance(selected_trend, list):
+        selected_trend = selected_trend[0] if selected_trend else None
+
+    if selected_trend not in trend_options:
+        return 'TURNOUT_PCT'
+
+    return selected_trend
 
 def get_timeline_plot(df_filtered):
     # Create a timeline plot of dog postings over time
@@ -432,12 +448,12 @@ def get_choropleth_candidate(candidate_name):
         df
     )
     print(df_map.head())
-    if candidate_name.startswith('SJD9'):
+    if my_color.startswith('SJD9_'):
         df_map = (
             df_map
             .filter(pl.col('CITY_DIST') == 'San Jose 9')
         )
-    if candidate_name.startswith('SCC1_'):
+    if my_color.startswith('SCC1_'):
         df_map = (
             df_map
             .filter(pl.col('COUNTY_DIST') == 1)
@@ -452,41 +468,27 @@ def get_choropleth_candidate(candidate_name):
     range_color = [10, 50]
     print(f'{my_color_scale = }')
     
-    
-    candidate_min_pct = (
-        df_map
-        .filter(pl.col(my_color) > 2 )
-        .select(my_color)
-        .min()
-        .item(0, my_color)
-    )   
-    print(f'{candidate_min_pct = }')
-    
+    # Build a stable color range from observed values to avoid None/empty edge cases.
+    value_stats = df_map.select([
+        pl.col(my_color).drop_nulls().min().alias('min_val'),
+        pl.col(my_color).drop_nulls().max().alias('max_val'),
+        pl.col(my_color).drop_nulls().quantile(0.1).alias('q10'),
+        pl.col(my_color).drop_nulls().quantile(0.9).alias('q90'),
+    ])
+    min_val, max_val, q10, q90 = value_stats.row(0)
 
-    candidate_max_pct = (
-        df_map
-        .filter(pl.col(my_color) < 50 )
-        .select(my_color)
-        .max()
-        .item(0, my_color)
-    )  
-    print(f'{candidate_max_pct = }')
-    
-    candidate_median_pct = (
-        df_map
-        .filter(pl.col(my_color).is_between(candidate_min_pct, candidate_max_pct) )
-        .select(my_color)
-        .median()
-        .item(0, my_color)
-    ) 
-    print(f'{candidate_median_pct = }')
-
-    pct_span = candidate_max_pct - candidate_min_pct
-    print(f'{pct_span = }')
-    my_color_range = [
-        candidate_median_pct-5, # 0.25*pct_span, 
-        candidate_median_pct+5, # 0.25*pct_span
-    ]
+    if min_val is None or max_val is None:
+        my_color_range = [0, 1]
+    else:
+        low = q10 if q10 is not None else min_val
+        high = q90 if q90 is not None else max_val
+        if high <= low:
+            if max_val > min_val:
+                low, high = min_val, max_val
+            else:
+                pad = 1 if min_val == 0 else abs(min_val) * 0.1
+                low, high = min_val - pad, max_val + pad
+        my_color_range = [float(low), float(high)]
  
     print(f'{my_color_range = }')
 
@@ -529,33 +531,55 @@ def get_candidate_bar_chart(my_color):
         prefix = 'GOV_'
         names = gov_names
         df_bar = df
+        election_title = 'Governor'
     elif my_color.startswith('AG_'):
         prefix = 'AG_'
         names = ag_names
         df_bar = df
+        election_title = 'Attorney General'
     elif my_color.startswith('DA_'):
         prefix = 'DA_'
         names = da_names
         df_bar = df
+        election_title = 'District Attorney'
     elif my_color.startswith('SCC1_'):
         prefix = 'SCC1_'
         names = bos_names
         df_bar = df.filter(pl.col('COUNTY_DIST') == 1)
+        election_title = 'County Supervisor District 1'
     elif my_color.startswith('SJD9_'):
         prefix = 'SJD9_'
         names = sj_d9_names
         df_bar = df.filter(pl.col('CITY_DIST') == 'San Jose 9')
+        election_title = 'San Jose Councilmember District 9'
     else:
         return go.Figure()
 
     vote_cols = [prefix + n for n in names]
     totals = df_bar.select([pl.col(c).sum().alias(c) for c in vote_cols])
-    total_votes = sum(totals.row(0))
-    row = totals.row(0)
-    pcts = [round(v / total_votes * 100, 1) if total_votes else 0.0 for v in row]
+    named_votes = list(totals.row(0))
+    named_total_votes = sum(named_votes)
+
+    # Add an explicit Others bucket for votes not in named candidate columns.
+    if 'ACT_VOTERS' in df_bar.columns:
+        total_cast_votes = df_bar.select(pl.col('ACT_VOTERS').sum()).item()
+        others_votes = max(total_cast_votes - named_total_votes, 0)
+    else:
+        others_votes = 0
+
+    all_names = names + ['OTHERS']
+    all_votes = named_votes + [others_votes]
+    total_votes = sum(all_votes)
+    pcts = [round(v / total_votes * 100, 1) if total_votes else 0.0 for v in all_votes]
+
+    democratic_candidates = {'BECERRA', 'STEYER', 'BONTA', 'ROSEN', 'ARENAS', 'CHESTER'}
+    candidate_colors = [
+        'gray' if name == 'OTHERS' else (my_blue if name in democratic_candidates else my_red)
+        for name in all_names
+    ]
 
     df_agg = (
-        pl.DataFrame({'Candidate': names, 'Pct': pcts})
+        pl.DataFrame({'Candidate': all_names, 'Pct': pcts, 'BarColor': candidate_colors})
         .sort('Pct', descending=False)  # ascending → lowest at bottom, highest at top
     )
 
@@ -565,12 +589,14 @@ def get_candidate_bar_chart(my_color):
         x='Pct',
         orientation='h',
         template='simple_white',
+        title=f'{election_title} Vote % by Candidate',
         text='Pct',
         labels={'Pct': 'Vote %', 'Candidate': ''},
     )
+    fig.update_traces(marker_color=df_agg.get_column('BarColor').to_list())
     fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
     fig.update_layout(
-        margin={'r': 60, 't': 10, 'l': 10, 'b': 30},
+        margin={'r': 60, 't': 70, 'l': 10, 'b': 30},
         xaxis=dict(showticklabels=False, showgrid=False, title=''),
     )
     return fig
@@ -580,6 +606,19 @@ def get_trend_bar_chart(trend_name):
         trend_name = trend_name[0]
     if trend_name is None:
         return go.Figure()
+
+    trend_title_map = {
+        'TURNOUT_PCT': 'Turnout %',
+        'REDNESS': 'Redness',
+        'BLUENESS': 'Blueness',
+    }
+    trend_title = trend_title_map.get(trend_name, trend_name)
+    trend_bar_color_map = {
+        'TURNOUT_PCT': 'gray',
+        'REDNESS': my_red,
+        'BLUENESS': my_blue,
+    }
+    trend_bar_color = trend_bar_color_map.get(trend_name, 'gray')
 
     df_agg = (
         df
@@ -594,9 +633,11 @@ def get_trend_bar_chart(trend_name):
         x='Value',
         orientation='h',
         template='simple_white',
+        title=f'{trend_title} by City',
         text='Value',
         labels={'Value': f'{trend_name} %', 'CITY': ''},
     )
+    fig.update_traces(marker_color=trend_bar_color)
     fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
     fig.update_layout(
         margin={'r': 60, 't': 10, 'l': 10, 'b': 30},
@@ -614,8 +655,12 @@ election_list = ['Governor', 'Attorney General', 'District Attorney',
 dcc_select_trend = (
     dcc.Dropdown(
         id='id_select_trend',
-        options=['REDNESS', 'BLUENESS', 'TURNOUT_PCT'],
-        value=['TURNOUT_PCT'],    # Default selected values
+        options=[
+            {'label': 'Turnout %', 'value': 'TURNOUT_PCT'},
+            {'label': 'Redness', 'value': 'REDNESS'},
+            {'label': 'Blueness', 'value': 'BLUENESS'},
+        ],
+        value='TURNOUT_PCT',    # Default selected value
         multi=False,           # Enable multiple selection
         placeholder="Select one of these elections...",
         style={"width": "50%"}
@@ -695,7 +740,7 @@ app.layout =  dmc.MantineProvider([
         dmc.GridCol(dcc.Graph(id='choropleth-trend'), span=5, offset=1), 
         dmc.GridCol(dcc.Graph(id='choropleth-candidate'), span=5, offset=1),           
     ]),
-    dmc.Space(h=10),
+    dmc.Space(h=150),
     dmc.Grid(children = [
         dmc.GridCol(dcc.Graph(id='bar-trend'), span=5, offset=1),
         dmc.GridCol(dcc.Graph(id='bar-candidate'), span=5, offset=1),
@@ -746,7 +791,8 @@ def callback_candidate_map(candidate):
     Input('id_select_trend', 'value')
     )
 def callback(trend):
-    print(f'{trend = }')
-    return get_choropleth_trend(trend), get_trend_bar_chart(trend)
+    selected_trend = normalize_trend_selection(trend)
+    print(f'{selected_trend = }')
+    return get_choropleth_trend(selected_trend), get_trend_bar_chart(selected_trend)
 if __name__ == '__main__':
     app.run(debug=True)
